@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FLUTTER_VERSION: "3.44.4"
+  FLUTTER_VERSION: "3.47.0"
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   INCLUDE_MACOS: ${{ vars.MACOS_RELEASE_ENABLED == 'true' && 'true' || 'false' }}
   PUBLIC_RELEASE_REPOSITORY: "miloquinn/open-reading"
