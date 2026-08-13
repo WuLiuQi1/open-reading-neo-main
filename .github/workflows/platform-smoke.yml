@@ -143,3 +143,25 @@ jobs:
 
       - name: Build iOS release without code signing
         run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned iOS IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="build/ios/iphoneos/Runner.app"
+          test -d "$app_path"
+          mkdir -p unsigned-ipa/Payload
+          cp -R "$app_path" unsigned-ipa/Payload/Runner.app
+          (
+            cd unsigned-ipa
+            zip -qry "../OpenReading-iOS-unsigned.ipa" Payload
+          )
+          test -s OpenReading-iOS-unsigned.ipa
+
+      - name: Upload unsigned iOS IPA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: OpenReading-iOS-unsigned
+          path: OpenReading-iOS-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
