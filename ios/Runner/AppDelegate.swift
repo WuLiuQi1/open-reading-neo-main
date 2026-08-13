@@ -1,0 +1,264 @@
+import Flutter
+import UIKit
+
+final class AuthCallbackBridge {
+  static let shared = AuthCallbackBridge()
+  private var channel: FlutterMethodChannel?
+  private var pending: String?
+
+  static func isCallback(_ url: URL) -> Bool {
+    url.scheme?.lowercased() == "xxread"
+      && url.host?.lowercased() == "auth"
+      && url.path == "/device"
+  }
+
+  func attach(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(
+      name: "com.niki.xxread/account_auth",
+      binaryMessenger: messenger
+    )
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "getInitialAuthCallback" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      result(self?.pending)
+      self?.pending = nil
+    }
+    self.channel = channel
+  }
+
+  func accept(urls: [URL]) {
+    guard let url = urls.first(where: Self.isCallback) else { return }
+    pending = url.absoluteString
+    channel?.invokeMethod("onAuthCallback", arguments: url.absoluteString)
+  }
+}
+
+@objc(ReaderFlutterViewController) class ReaderFlutterViewController: FlutterViewController {
+  private var readerImmersiveEnabled = false {
+    didSet {
+      if oldValue != readerImmersiveEnabled {
+        refreshImmersiveUI()
+      }
+    }
+  }
+
+  override var prefersHomeIndicatorAutoHidden: Bool {
+    readerImmersiveEnabled
+  }
+
+  override var prefersStatusBarHidden: Bool {
+    readerImmersiveEnabled
+  }
+
+  override var preferredStatusBarUpdateAnimation: UIStatusBarAnimation {
+    .fade
+  }
+
+  override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
+    readerImmersiveEnabled ? .all : []
+  }
+
+  @objc func setReaderImmersiveEnabled(_ enabled: Bool) {
+    readerImmersiveEnabled = enabled
+    if enabled {
+      refreshImmersiveUI()
+    }
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    if readerImmersiveEnabled {
+      refreshImmersiveUI()
+    }
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    if readerImmersiveEnabled {
+      refreshImmersiveUI()
+    }
+  }
+
+  private func refreshImmersiveUI() {
+    setNeedsStatusBarAppearanceUpdate()
+    setNeedsUpdateOfHomeIndicatorAutoHidden()
+    setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+  }
+}
+
+@main
+@objc class AppDelegate: FlutterAppDelegate, FlutterPluginRegistrant {
+  private var readerImmersiveEnabled = false
+  private var storageBridge: StorageBridge?
+  private var incomingBookBridge: IncomingBookBridge?
+  private var readerAloudMediaBridge: ReaderAloudMediaBridge?
+
+  override func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    pluginRegistrant = self
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  func register(with registry: FlutterPluginRegistry) {
+    GeneratedPluginRegistrant.register(with: registry)
+
+    guard let messenger = registry.registrar(forPlugin: "ReaderUIBridge")?.messenger() else {
+      NSLog("Reader bridge init failed: binaryMessenger unavailable")
+      return
+    }
+
+    AuthCallbackBridge.shared.attach(messenger: messenger)
+
+    let readerUIChannel = FlutterMethodChannel(
+      name: "com.niki.xxread/reader_ui",
+      binaryMessenger: messenger
+    )
+    readerUIChannel.setMethodCallHandler { [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) in
+      switch call.method {
+      case "setReaderImmersive":
+        guard let args = call.arguments as? [String: Any],
+              let enabled = args["enabled"] as? Bool else {
+          result(
+            FlutterError(
+              code: "invalid_args",
+              message: "expected {enabled: bool}",
+              details: nil
+            )
+          )
+          return
+        }
+        self?.readerImmersiveEnabled = enabled
+        self?.applyReaderImmersiveIfPossible()
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let readerStatusChannel = FlutterMethodChannel(
+      name: "com.niki.xxread/reader_status",
+      binaryMessenger: messenger
+    )
+    readerStatusChannel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in
+      switch call.method {
+      case "getBatteryStatus":
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let level = UIDevice.current.batteryLevel
+        guard level >= 0 else {
+          result(nil)
+          return
+        }
+        let state = UIDevice.current.batteryState
+        result([
+          "level": Int((level * 100).rounded()),
+          "charging": state == .charging || state == .full,
+        ])
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let frameRateChannel = FlutterMethodChannel(
+      name: "com.niki.xxread/fullscreen",
+      binaryMessenger: messenger
+    )
+    frameRateChannel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in
+      switch call.method {
+      case "setPowerSavingMode":
+        guard let args = call.arguments as? [String: Any],
+              let enabled = args["enabled"] as? Bool else {
+          result(
+            FlutterError(
+              code: "invalid_args",
+              message: "expected {enabled: bool}",
+              details: nil
+            )
+          )
+          return
+        }
+        IOSFrameRateController.setPowerSavingMode(enabled)
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    storageBridge = StorageBridge(messenger: messenger)
+    incomingBookBridge = IncomingBookBridge(messenger: messenger)
+    if readerAloudMediaBridge == nil {
+      readerAloudMediaBridge = ReaderAloudMediaBridge(messenger: messenger)
+    }
+
+  }
+
+  override func applicationDidBecomeActive(_ application: UIApplication) {
+    super.applicationDidBecomeActive(application)
+    applyReaderImmersiveIfPossible()
+    IncomingBookInbox.shared.consumeSharedExtensionInboxIfConfigured()
+  }
+
+  override func application(
+    _ app: UIApplication,
+    open url: URL,
+    options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+  ) -> Bool {
+    if !IncomingBookInbox.uniqueSupportedFileURLs([url]).isEmpty {
+      IncomingBookInbox.shared.accept(urls: [url], action: "open")
+      return true
+    }
+    return super.application(app, open: url, options: options)
+  }
+
+  private func applyReaderImmersiveIfPossible() {
+    guard let controller = currentReaderController() else { return }
+    controller.setReaderImmersiveEnabled(readerImmersiveEnabled)
+  }
+
+  private func currentReaderController() -> ReaderFlutterViewController? {
+    if #available(iOS 13.0, *) {
+      for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+        let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first
+        if let found = findReaderController(in: keyWindow?.rootViewController) {
+          return found
+        }
+      }
+      return nil
+    }
+    return findReaderController(in: window?.rootViewController)
+  }
+
+  private func findReaderController(in viewController: UIViewController?) -> ReaderFlutterViewController? {
+    guard let viewController else { return nil }
+    if let reader = viewController as? ReaderFlutterViewController {
+      return reader
+    }
+    if let presented = viewController.presentedViewController,
+       let found = findReaderController(in: presented) {
+      return found
+    }
+    if let nav = viewController as? UINavigationController {
+      for vc in nav.viewControllers {
+        if let found = findReaderController(in: vc) {
+          return found
+        }
+      }
+    }
+    if let tab = viewController as? UITabBarController {
+      for vc in tab.viewControllers ?? [] {
+        if let found = findReaderController(in: vc) {
+          return found
+        }
+      }
+    }
+    for child in viewController.children {
+      if let found = findReaderController(in: child) {
+        return found
+      }
+    }
+    return nil
+  }
+}

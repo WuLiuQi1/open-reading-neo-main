@@ -1,0 +1,203 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.4"
+
+jobs:
+  flutter-validation:
+    name: Core Flutter validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install locked dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Prepare QuickJS runtime for tests
+        shell: bash
+        run: |
+          quickjs_dir="${PUB_CACHE}/hosted/pub.dev/flutter_js-0.8.7/linux/shared"
+          test -f "${quickjs_dir}/libquickjs_c_bridge_plugin.so"
+          echo "LD_LIBRARY_PATH=${quickjs_dir}:${LD_LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+
+      - name: Generate localizations
+        run: flutter gen-l10n
+
+      - name: Verify generated localizations are current
+        run: git diff --exit-code -- lib/l10n
+
+      - name: Verify generated changelog is current
+        run: |
+          python3 -m unittest test/test_generate_changelog.py
+          python3 tool/generate_changelog.py --check
+
+      - name: Verify formatting
+        run: dart format --output=none --set-exit-if-changed lib test tool
+
+      - name: Analyze source
+        # Keep existing warnings visible without making them fatal. Analyzer
+        # errors still fail the job.
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run tests with coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' test_files < <(
+            find test -type f -name '*_test.dart' \
+              ! -name 'book_source_management_page_test.dart' \
+              ! -name 'book_source_reader_page_test.dart' \
+              -print0
+          )
+          flutter test --coverage "${test_files[@]}"
+
+      - name: Run stateful reader tests in isolated processes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These widget suites own process-global preferences, controllers,
+          # image codecs, and platform channels. Running one case per process
+          # keeps a framework leak from looking like an application failure.
+          management_tests=(
+            'keeps native ORSP source management available'
+            'uses one add flow regardless of the advanced toggle'
+            'keeps dense source metadata readable on narrow phones'
+            'groups connected sources by protocol'
+            'adding a source requires explicit third-party acknowledgment'
+            'selection mode exposes bulk source actions'
+            'shows operator-supplied rights metadata as unverified'
+            'large source collections build lazily and remain searchable'
+          )
+          for test_name in "${management_tests[@]}"; do
+            flutter test test/book_source_management_page_test.dart \
+              --plain-name "$test_name"
+          done
+
+          # The image-reader case deliberately leaves a page load pending so
+          # it can assert the reader shell before image decoding. Run the
+          # remaining stateful source-reader cases separately to keep that
+          # fixture from holding Flutter's combined test process open.
+          reader_tests=(
+            'image-only source chapters open in the paged image reader'
+            'cover opening skips a brief loader and fades directly to content'
+            'a genuinely slow opening never overlaps loader and content'
+            'loads source chapters and navigates to the next chapter'
+            'replacement rules clean source chapter titles and content'
+            'restores the last source chapter on reopen'
+            'uses the shared reader settings with independent margins'
+            'naturally aligns source body text in verticalScroll mode'
+            'naturally aligns source body text in instantPage mode'
+            'applies persisted source alignment and letter spacing'
+            'vertical source text keeps its natural continuous height'
+            'tablet source page curl uses two leaves and a subtle center divider'
+            'tablet source reader can disable the two-page layout'
+            'tablet spread progress tracks the last visible page and restores its left page'
+            'next chapter preview is ready even while a farther prefetch is pending'
+            'prefetched chapter turn does not wait for progress persistence'
+            'horizontal slide commits a prefetched chapter only after the animation settles'
+            'horizontal slide lets a new drag take over a cross-chapter settle'
+            'tablet forward chapter curl uses prefetched page one at half-page width without refetching'
+            'tablet forward chapter curl previews title and body leaves for a short chapter'
+            'tablet backward chapter curl targets the previous final spread left page'
+            'uses the light reader theme for status bar icon contrast'
+            'uses the dark reader theme for status bar icon contrast'
+            'system reader theme uses a solid pure-black status bar without glass'
+          )
+          for test_name in "${reader_tests[@]}"; do
+            flutter test test/book_source_reader_page_test.dart \
+              --plain-name "$test_name"
+          done
+
+      - name: Explain validation failures
+        if: ${{ failure() }}
+        run: |
+          echo '::error title=Flutter validation failed::Core tests and stateful widget tests are separate steps. Check the failing step name before treating this as a build failure.'
+
+      - name: Upload coverage report
+        if: ${{ !cancelled() && hashFiles('coverage/lcov.info') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: flutter-coverage-${{ github.sha }}
+          path: coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+  build-smoke:
+    name: Product build / ${{ matrix.name }}
+    needs: flutter-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    continue-on-error: ${{ matrix.advisory }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Android debug APK
+            command: flutter build apk --debug
+            advisory: false
+          - name: Web release
+            command: flutter build web --release
+            # Web currently exposes third-party and 64-bit integer JavaScript
+            # compatibility gaps. Keep the signal visible without blocking PRs.
+            advisory: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install locked dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Generate localizations
+        run: flutter gen-l10n
+
+      - name: Build ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
