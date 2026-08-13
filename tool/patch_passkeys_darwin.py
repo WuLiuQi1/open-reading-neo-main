@@ -39,11 +39,6 @@ def replace_method(source: str, signature: str, next_signature: str) -> str:
 
 def main() -> None:
     pub_cache = Path(os.environ.get("PUB_CACHE", Path.home() / ".pub-cache"))
-    package = pub_cache / "hosted" / "pub.dev" / f"passkeys_darwin-{VERSION}"
-    source_path = package / RELATIVE_SOURCE
-    if not source_path.is_file():
-        raise SystemExit(f"expected passkeys_darwin source was not found: {source_path}")
-
     lockfile = Path("pubspec.lock").read_text(encoding="utf-8")
     expected_lock_entry = (
         "  passkeys_darwin:\n"
@@ -53,24 +48,37 @@ def main() -> None:
         f'      sha256: "{EXPECTED_SHA256}"\n'
     )
     if expected_lock_entry not in lockfile or f'    version: "{VERSION}"' not in lockfile:
-        raise SystemExit("pubspec.lock no longer matches the reviewed passkeys_darwin release")
-
-    source = source_path.read_text(encoding="utf-8")
-    if "ASCredentialDataManager" not in source:
-        print("passkeys_darwin does not need the Xcode 16 compatibility patch")
+        # This source rewrite was reviewed only for 0.4.2+2. Newer releases
+        # may have moved the Swift source or removed the unavailable API, so
+        # never guess a replacement path or mutate a different version.
+        print(
+            "passkeys_darwin version differs from the reviewed Xcode 16 patch; "
+            "skipping the legacy passkeys rewrite"
+        )
     else:
-        source = replace_method(
-            source,
-            "    func signalUnknownCredential(relyingPartyId: String, credentialId: String, completion: @escaping (Result<Void, Error>) -> Void) {",
-            "    func signalAllAcceptedCredentials(",
-        )
-        source = replace_method(
-            source,
-            "    func signalAllAcceptedCredentials(relyingPartyId: String, userId: String, allAcceptedCredentialIds: [String], completion: @escaping (Result<Void, Error>) -> Void) {",
-            "    private func parseCredentials(",
-        )
-        source_path.write_text(source, encoding="utf-8")
-        print(f"patched {source_path}")
+        package = pub_cache / "hosted" / "pub.dev" / f"passkeys_darwin-{VERSION}"
+        source_path = package / RELATIVE_SOURCE
+        if not source_path.is_file():
+            raise SystemExit(
+                f"expected reviewed passkeys_darwin source was not found: {source_path}"
+            )
+
+        source = source_path.read_text(encoding="utf-8")
+        if "ASCredentialDataManager" not in source:
+            print("passkeys_darwin does not need the Xcode 16 compatibility patch")
+        else:
+            source = replace_method(
+                source,
+                "    func signalUnknownCredential(relyingPartyId: String, credentialId: String, completion: @escaping (Result<Void, Error>) -> Void) {",
+                "    func signalAllAcceptedCredentials(",
+            )
+            source = replace_method(
+                source,
+                "    func signalAllAcceptedCredentials(relyingPartyId: String, userId: String, allAcceptedCredentialIds: [String], completion: @escaping (Result<Void, Error>) -> Void) {",
+                "    private func parseCredentials(",
+            )
+            source_path.write_text(source, encoding="utf-8")
+            print(f"patched {source_path}")
 
     device_package = (
         pub_cache / "hosted" / "pub.dev" / f"device_info_plus-{DEVICE_INFO_VERSION}"
